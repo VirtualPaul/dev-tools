@@ -1,20 +1,17 @@
-#!/usr/bin/env bash
+#!/opt/homebrew/bin/bash
 set -euo pipefail
 
-# ===== CONFIG (override via env) =====
+# ===== CONFIG (override via env or flags) =====
 USER_GH="${USER_GH:-}"            # Your GitHub username; auto-detected from 'gh' if empty
 PROTOCOL="${PROTOCOL:-ssh}"       # ssh | https
-ROOT="."                          # default scan root (can be overridden by first non-flag arg)
 EXECUTE="${EXECUTE:-0}"           # 0 = dry-run, 1 = apply changes
-ADD_UPSTREAM="${ADD_UPSTREAM:-0}" # 1=keep/add upstream to original, 0=remove
-MAXDEPTH="${MAXDEPTH:-4}"         # how deep to search for repos
-# ====================================
-
-IGNORES=()                        # tokens/paths to skip
+ADD_UPSTREAM="${ADD_UPSTREAM:-0}" # 1=keep/add upstream to original repo, 0=remove
+ROOT="."                          # default scan root (overridden by positional arg)
+# =============================================
 
 usage() {
   cat <<EOF
-Usage: $(basename "$0") [OPTIONS] [ROOT] [--ignore repoA] [--ignore path/to/repoB] ...
+Usage: $(basename "$0") [OPTIONS] [ROOT]
 
 Options:
   --execute             Apply changes (default is dry-run)
@@ -24,16 +21,14 @@ Options:
   --user USERNAME       Override GitHub username (else auto-detect via 'gh')
   --add-upstream        Keep/add an 'upstream' remote to original repo
   --no-upstream         Remove 'upstream' remote (default)
-  --maxdepth N          Set find max depth (default: ${MAXDEPTH})
-  --ignore TOKEN        Skip repos whose path or name matches TOKEN (can repeat)
-
-Examples:
-  $(basename "$0") ~/dev --ignore sandbox --ignore /full/path/to/special-repo
-  USER_GH=virtualpaul EXECUTE=1 $(basename "$0") ~/dev --https --add-upstream --ignore experimental
+  --ignore TOKEN        Skip repos whose path or name contains TOKEN (repeatable)
+  -h, --help            Show this help
 EOF
 }
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; exit 1; }; }
+
+IGNORES=()
 
 parse_args() {
   local positional_seen=0
@@ -46,18 +41,17 @@ parse_args() {
       --user) USER_GH="${2:-}"; shift 2 ;;
       --add-upstream) ADD_UPSTREAM=1; shift ;;
       --no-upstream) ADD_UPSTREAM=0; shift ;;
-      --maxdepth) MAXDEPTH="${2:-4}"; shift 2 ;;
-      --ignore) IGNORES+=("${2:-}"); shift 2 ;;
+      --ignore)
+        if [[ -n "${2:-}" ]]; then IGNORES+=("$2"); fi
+        shift 2
+        ;;
       -h|--help) usage; exit 0 ;;
       --) shift; break ;;
       -*)
         echo "Unknown option: $1"; usage; exit 1 ;;
       *)
-        if [[ $positional_seen -eq 0 ]]; then
-          ROOT="$1"; positional_seen=1; shift
-        else
-          # Treat any additional bare words as ignores (nice shortcut)
-          IGNORES+=("$1"); shift
+        if [[ $positional_seen -eq 0 ]]; then ROOT="$1"; positional_seen=1; shift
+        else IGNORES+=("$1"); shift
         fi
         ;;
     esac
@@ -92,100 +86,111 @@ ensure_user() {
   fi
 }
 
-is_ignored() {
-  local repo_dir="$1"
-  local name; name="$(basename "$repo_dir")"
-  for tok in "${IGNORES[@]:-}"; do
-    # substring match on either full path or repo name
-    [[ "$repo_dir" == *"$tok"* || "$name" == *"$tok"* ]] && return 0
-  done
-  return 0
-}
-
-# Faster exact/substring ignore (case-sensitive); tweak if you need regex/glob semantics
 matches_ignore() {
   local repo_dir="$1"
   local name; name="$(basename "$repo_dir")"
   for tok in "${IGNORES[@]:-}"; do
-    [[ "$repo_dir" == *"$tok"* || "$name" == *"$tok"* ]] && return 0
+    [[ -z "$tok" ]] && continue
+    if [[ "$repo_dir" == *"$tok"* || "$name" == *"$tok"* ]]; then
+      return 0
+    fi
   done
   return 1
 }
 
-fork_exists() { gh repo view "$USER_GH/$1" >/dev/null 2>&1; }
-
-create_fork_if_missing() {
-  local src_owner="$1" src_repo="$2"
-  if fork_exists "$src_repo"; then
-    echo "   - fork already exists: $USER_GH/$src_repo"
-  else
-    echo "   - creating fork: $USER_GH/$src_repo (from $src_owner/$src_repo)"
-    [[ "$EXECUTE" -eq 1 ]] && gh repo fork "$src_owner/$src_repo" --clone=false --remote=false >/dev/null
-  fi
-}
-
 process_repo() {
   local repo_dir="$1"
-  # ignore filter
+
   if matches_ignore "$repo_dir"; then
+    echo ">> skipped (ignored): $repo_dir"
     return 0
   fi
 
-  cd "$repo_dir"
-  [[ -d .git ]] || return 0
+  if [[ ! -d "$repo_dir" ]]; then
+    echo "!! not a dir: $repo_dir"
+    return 0
+  fi
+  if [[ ! -d "$repo_dir/.git" && ! -f "$repo_dir/.git" ]]; then
+    echo ">> skipped (no .git): $repo_dir"
+    return 0
+  fi
 
-  local origin_url pair owner repo
-  origin_url="$(git remote get-url origin 2>/dev/null || true)"
-  [[ -n "$origin_url" ]] || return 0
+  echo "==> $repo_dir"
 
+  local origin_url
+  origin_url="$(git -C "$repo_dir" remote get-url origin 2>/dev/null || true)"
+  if [[ -z "$origin_url" ]]; then
+    echo "   - skipped: no 'origin' remote configured"
+    echo
+    return 0
+  fi
+  if [[ "$origin_url" != *github.com* ]]; then
+    echo "   - skipped: non-GitHub origin: $origin_url"
+    echo
+    return 0
+  fi
+
+  local pair owner repo
   pair="$(parse_owner_repo "$origin_url")"
-  [[ -n "$pair" ]] || return 0
+  if [[ -z "$pair" ]]; then
+    echo "   - skipped: could not parse owner/repo from: $origin_url"
+    echo
+    return 0
+  fi
   owner="${pair%/*}"
   repo="${pair#*/}"
 
-  echo "==> $(pwd)"
-
+  # Case-insensitive compare for your username
+  shopt -s nocasematch
   if [[ "$owner" == "$USER_GH" ]]; then
+    shopt -u nocasematch
     local desired_origin; desired_origin="$(gh_url "$USER_GH" "$repo")"
     if [[ "$origin_url" == "$desired_origin" ]]; then
       echo "   - origin already your repo ($desired_origin)"
     else
       echo "   - normalize origin -> $desired_origin"
-      [[ "$EXECUTE" -eq 1 ]] && git remote set-url origin "$desired_origin"
+      [[ "$EXECUTE" -eq 1 ]] && git -C "$repo_dir" remote set-url origin "$desired_origin"
     fi
-    if git remote | grep -qx upstream; then
+    if git -C "$repo_dir" remote | grep -qx upstream; then
       if [[ "$ADD_UPSTREAM" -eq 0 ]]; then
         echo "   - removing upstream (per --no-upstream)"
-        [[ "$EXECUTE" -eq 1 ]] && git remote remove upstream
+        [[ "$EXECUTE" -eq 1 ]] && git -C "$repo_dir" remote remove upstream
       fi
     fi
     echo
     return 0
   fi
+  shopt -u nocasematch
 
-  # Not your repo -> ensure fork and rewire
   echo "   - origin belongs to $owner/$repo"
-  create_fork_if_missing "$owner" "$repo"
+
+  # Ensure your fork exists (no-op if it does)
+  if gh repo view "$USER_GH/$repo" >/dev/null 2>&1; then
+    echo "   - fork exists: $USER_GH/$repo"
+  else
+    echo "   - creating fork: $USER_GH/$repo (from $owner/$repo)"
+    [[ "$EXECUTE" -eq 1 ]] && gh repo fork "$owner/$repo" --clone=false --remote=false >/dev/null
+  fi
 
   local desired_origin desired_upstream
   desired_origin="$(gh_url "$USER_GH" "$repo")"
   desired_upstream="$(gh_url "$owner" "$repo")"
 
   echo "   - set origin -> $desired_origin"
-  [[ "$EXECUTE" -eq 1 ]] && git remote set-url origin "$desired_origin"
+  [[ "$EXECUTE" -eq 1 ]] && git -C "$repo_dir" remote set-url origin "$desired_origin"
 
   if [[ "$ADD_UPSTREAM" -eq 1 ]]; then
-    if git remote | grep -qx upstream; then
+    if git -C "$repo_dir" remote | grep -qx upstream; then
       echo "   - set upstream -> $desired_upstream"
-      [[ "$EXECUTE" -eq 1 ]] && git remote set-url upstream "$desired_upstream"
+      [[ "$EXECUTE" -eq 1 ]] && git -C "$repo_dir" remote set-url upstream "$desired_upstream"
     else
       echo "   - add upstream -> $desired_upstream"
-      [[ "$EXECUTE" -eq 1 ]] && git remote add upstream "$desired_upstream"
+      [[ "$EXECUTE" -eq 1 ]] && git -C "$repo_dir" remote add upstream "$desired_upstream"
     fi
   else
-    if git remote | grep -qx upstream; then
+    if git -C "$repo_dir" remote | grep -qx upstream; then
       echo "   - removing upstream (per --no-upstream)"
-      [[ "$EXECUTE" -eq 1 ]] && git remote remove upstream
+      [[ "$EXECUTE" -eq 1 ]] && git -C "$repo_dir" remote remove upstream
     fi
   fi
 
@@ -196,12 +201,29 @@ main() {
   need git
   need gh
   parse_args "$@"
-  ensure_user
 
-  # Walk repos and process
-  while IFS= read -r gitdir; do
-    process_repo "$(dirname "$gitdir")"
-  done < <(find "$ROOT" -type d -name .git -prune -maxdepth "$MAXDEPTH" 2>/dev/null)
+  if [[ -z "$USER_GH" ]]; then
+    USER_GH="$(gh api user -q .login 2>/dev/null || true)"
+    [[ -n "$USER_GH" ]] || { echo "Could not determine GitHub username; set --user or USER_GH=..."; exit 1; }
+  fi
+
+  local abs_root
+  abs_root="$(cd "$ROOT" && pwd)"
+  echo "Scanning: $abs_root   as user: $USER_GH   protocol: $PROTOCOL   execute: $EXECUTE   add_upstream: $ADD_UPSTREAM"
+  echo "Ignore tokens: ${IGNORES[*]:-<none>}"
+
+  # Collect .git paths first (works for .git dir OR file)
+  mapfile -t gitpaths < <(find "$abs_root" -name .git -print 2>/dev/null || true)
+
+  if [[ ${#gitpaths[@]} -eq 0 ]]; then
+    echo "No repos found under $abs_root"
+    exit 0
+  fi
+
+  for gitpath in "${gitpaths[@]}"; do
+    repo_dir="$(dirname "$gitpath")"
+    process_repo "$repo_dir"
+  done
 }
 
 main "$@"
